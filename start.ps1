@@ -1,8 +1,30 @@
 # Launcher: starts the DeepSeek bridge in a new window, waits for /health,
 # then runs `claude` in the current window with ANTHROPIC_BASE_URL pointed at it.
+#
+# Usage:
+#   .\start.ps1                         # launches claude in the current folder
+#   .\start.ps1 C:\Projects\MyApp       # launches claude in C:\Projects\MyApp
+#   .\start.ps1 -Path C:\... -- <args>  # passes extra args to claude
+
+param(
+    [Parameter(Position = 0)]
+    [string]$Path,
+
+    [Parameter(ValueFromRemainingArguments = $true)]
+    [string[]]$ClaudeArgs
+)
 
 $ErrorActionPreference = 'Stop'
 $root = $PSScriptRoot
+
+# If a target folder was given, switch to it before launching claude.
+if ($Path) {
+    if (-not (Test-Path -LiteralPath $Path -PathType Container)) {
+        Write-Host "Target folder does not exist: $Path" -ForegroundColor Red
+        exit 1
+    }
+    Set-Location -LiteralPath $Path
+}
 
 # Read PORT and PROXY_API_KEY from .env (if present).
 $port = 4141
@@ -50,7 +72,7 @@ if (-not $ok) {
     exit 1
 }
 
-Write-Host "Bridge is up. Launching Claude Code..." -ForegroundColor Green
+Write-Host "Bridge is up. Launching Claude Code in $((Get-Location).Path)" -ForegroundColor Green
 $env:ANTHROPIC_BASE_URL = "http://localhost:$port"
 $env:ANTHROPIC_API_KEY = $apiKey
-claude @args
+if ($ClaudeArgs) { claude @ClaudeArgs } else { claude }
