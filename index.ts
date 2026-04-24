@@ -59,12 +59,6 @@ interface ParsedToolCall {
   input: Record<string, unknown>;
 }
 
-interface DeepseekCollectedOutput {
-  text: string;
-  requestMessageId: number | null;
-  responseMessageId: number | null;
-}
-
 interface ConversationState {
   session: DeepseekSession;
   parentMessageId: number | null;
@@ -74,13 +68,27 @@ interface ConversationState {
 const PORT = Number(process.env.PORT ?? "4141");
 const TOKEN = process.env.DEEPSEEK_TOKEN;
 const PROXY_API_KEY = process.env.PROXY_API_KEY;
+const CONVERSATION_TTL_MS = Math.max(
+  60_000,
+  Number(process.env.CONVERSATION_TTL_MINUTES ?? "60") * 60_000,
+);
+const CONVERSATION_SWEEP_MS = 5 * 60_000;
 
 if (!TOKEN) {
-  throw new Error("Missing DEEPSEEK_TOKEN in environment");
+  throw new Error("Missing DEEPSEEK_TOKEN in environment (see .env)");
 }
 
 let clientPromise: Promise<DeepseekClientInstance> | null = null;
 const conversationStore = new Map<string, ConversationState>();
+
+setInterval(() => {
+  const now = Date.now();
+  for (const [key, state] of conversationStore) {
+    if (now - state.updatedAt > CONVERSATION_TTL_MS) {
+      conversationStore.delete(key);
+    }
+  }
+}, CONVERSATION_SWEEP_MS).unref?.();
 
 function getClient(): Promise<DeepseekClientInstance> {
   if (!clientPromise) {
@@ -229,14 +237,36 @@ function extractSystemText(system: AnthropicRequest["system"]): string {
   return "";
 }
 
-function buildDeepseekPrompt(body: AnthropicRequest): string {
+function extractLastTurn(messages: AnthropicMessage[]): AnthropicMessage[] {
+  for (let i = messages.length - 1; i >= 0; i -= 1) {
+    if (messages[i]?.role === "assistant") {
+      return messages.slice(i + 1);
+    }
+  }
+  // No assistant in history but isContinuation=true: DeepSeek session already
+  // holds prior context. Send only the newest user message, not the whole array,
+  // to avoid duplicating what the session has seen.
+  for (let i = messages.length - 1; i >= 0; i -= 1) {
+    if (messages[i]?.role === "user") {
+      return messages.slice(i);
+    }
+  }
+  return [];
+}
+
+function buildDeepseekPrompt(body: AnthropicRequest, isContinuation: boolean): string {
   const chunks: string[] = [];
-  const systemText = extractSystemText(body.system);
-  if (systemText.length > 0) {
-    chunks.push(`System:\n${systemText}`);
+
+  if (!isContinuation) {
+    const systemText = extractSystemText(body.system);
+    if (systemText.length > 0) {
+      chunks.push(`System:\n${systemText}`);
+    }
   }
 
-  for (const message of body.messages) {
+  const messagesToSend = isContinuation ? extractLastTurn(body.messages) : body.messages;
+
+  for (const message of messagesToSend) {
     const text = extractMessageText(message.content);
     if (!text) continue;
 
@@ -245,14 +275,18 @@ function buildDeepseekPrompt(body: AnthropicRequest): string {
   }
 
   if (Array.isArray(body.tools) && body.tools.length > 0) {
-    const toolNames = body.tools.map((tool) => tool.name).join(", ");
+    const toolLines = body.tools.map((tool) => {
+      const desc = tool.description ? ` — ${tool.description}` : "";
+      const schema = tool.input_schema ? ` schema=${toCompactJson(tool.input_schema)}` : "";
+      return `- ${tool.name}${desc}${schema}`;
+    });
     chunks.push(
       [
         "Tools available:",
-        toolNames,
-        'If you need to call a tool, output ONLY valid JSON in this exact shape:',
+        ...toolLines,
+        "If you need to call a tool, output ONLY valid JSON in this exact shape:",
         '{"tool":"<tool_name>","arguments":{...}}',
-        "Do not add markdown fences, explanations, or fake tool results.",
+        "No prose, no markdown fences, no fake tool results.",
       ].join("\n"),
     );
   }
@@ -408,72 +442,6 @@ function extractMessageIds(
   }
 }
 
-async function collectDeepseekOutput(response: Response): Promise<DeepseekCollectedOutput> {
-  let text = "";
-  const idState: { requestMessageId: number | null; responseMessageId: number | null } = {
-    requestMessageId: null,
-    responseMessageId: null,
-  };
-
-  if (!response.body) {
-    return {
-      text,
-      requestMessageId: idState.requestMessageId,
-      responseMessageId: idState.responseMessageId,
-    };
-  }
-
-  const reader = response.body.getReader();
-  const decoder = new TextDecoder();
-  const chunkState: { fragmentType: string | null } = { fragmentType: null };
-  let buffer = "";
-
-  try {
-    while (true) {
-      const { done, value } = await reader.read();
-      if (done) break;
-
-      buffer += decoder.decode(value, { stream: true });
-      const lines = buffer.split(/\r?\n/);
-      buffer = lines.pop() ?? "";
-
-      for (const line of lines) {
-        const event = parseStreamLine(line);
-        if (!event) continue;
-
-        extractMessageIds(event, idState);
-        const textChunks = extractResponseChunks(event, chunkState);
-        for (const textChunk of textChunks) {
-          if (textChunk.length > 0) {
-            text += textChunk;
-          }
-        }
-      }
-    }
-
-    if (buffer.length > 0) {
-      const event = parseStreamLine(buffer);
-      if (event) {
-        extractMessageIds(event, idState);
-        const textChunks = extractResponseChunks(event, chunkState);
-        for (const textChunk of textChunks) {
-          if (textChunk.length > 0) {
-            text += textChunk;
-          }
-        }
-      }
-    }
-  } finally {
-    reader.releaseLock();
-  }
-
-  return {
-    text,
-    requestMessageId: idState.requestMessageId,
-    responseMessageId: idState.responseMessageId,
-  };
-}
-
 function splitTextForSse(text: string, chunkSize = 120): string[] {
   if (!text) return [];
   const chunks: string[] = [];
@@ -546,18 +514,39 @@ function extractResponseChunks(event: DeepseekPatchEvent, state: { fragmentType:
   return chunks;
 }
 
-async function* deepseekToTextDeltas(response: Response): AsyncGenerator<string, void, void> {
+interface DeepseekStreamState {
+  readonly idState: { requestMessageId: number | null; responseMessageId: number | null };
+}
+
+async function* streamDeepseek(
+  response: Response,
+  state: DeepseekStreamState,
+  signal?: AbortSignal,
+): AsyncGenerator<string, void, void> {
   if (!response.body) {
     return;
   }
 
   const reader = response.body.getReader();
   const decoder = new TextDecoder();
-  const state: { fragmentType: string | null } = { fragmentType: null };
+  const fragmentState: { fragmentType: string | null } = { fragmentType: null };
   let buffer = "";
+
+  let cancelPromise: Promise<void> | null = null;
+  const onAbort = () => {
+    if (!cancelPromise) {
+      cancelPromise = reader.cancel().catch(() => {});
+    }
+  };
+  signal?.addEventListener("abort", onAbort);
+  // Handle the case where the request was already aborted before we subscribed.
+  if (signal?.aborted) {
+    onAbort();
+  }
 
   try {
     while (true) {
+      if (signal?.aborted) break;
       const { done, value } = await reader.read();
       if (done) break;
 
@@ -569,11 +558,10 @@ async function* deepseekToTextDeltas(response: Response): AsyncGenerator<string,
         const event = parseStreamLine(line);
         if (!event) continue;
 
-        const textChunks = extractResponseChunks(event, state);
+        extractMessageIds(event, state.idState);
+        const textChunks = extractResponseChunks(event, fragmentState);
         for (const textChunk of textChunks) {
-          if (textChunk.length > 0) {
-            yield textChunk;
-          }
+          if (textChunk.length > 0) yield textChunk;
         }
       }
     }
@@ -581,16 +569,23 @@ async function* deepseekToTextDeltas(response: Response): AsyncGenerator<string,
     if (buffer.length > 0) {
       const event = parseStreamLine(buffer);
       if (event) {
-        const textChunks = extractResponseChunks(event, state);
+        extractMessageIds(event, state.idState);
+        const textChunks = extractResponseChunks(event, fragmentState);
         for (const textChunk of textChunks) {
-          if (textChunk.length > 0) {
-            yield textChunk;
-          }
+          if (textChunk.length > 0) yield textChunk;
         }
       }
     }
   } finally {
-    reader.releaseLock();
+    signal?.removeEventListener("abort", onAbort);
+    if (cancelPromise) {
+      await cancelPromise;
+    }
+    try {
+      reader.releaseLock();
+    } catch {
+      /* already released on cancel */
+    }
   }
 }
 
@@ -634,6 +629,25 @@ async function getConversationState(req: Request, client: DeepseekClientInstance
   return created;
 }
 
+async function readUpstreamError(response: Response): Promise<string> {
+  try {
+    const text = await response.text();
+    return text.length > 0 ? text.slice(0, 500) : `status ${response.status}`;
+  } catch {
+    return `status ${response.status}`;
+  }
+}
+
+function looksLikeJsonStart(text: string): boolean {
+  const trimmed = text.trimStart();
+  if (trimmed.length === 0) return false;
+  if (trimmed.startsWith("{")) return true;
+  if (/^```(?:json)?/i.test(trimmed)) return true;
+  return false;
+}
+
+const PEEK_THRESHOLD = 48;
+
 async function handleMessages(req: Request): Promise<Response> {
   if (PROXY_API_KEY) {
     const requestApiKey = req.headers.get("x-api-key");
@@ -653,170 +667,253 @@ async function handleMessages(req: Request): Promise<Response> {
     return anthropicError("`messages` must be a non-empty array");
   }
 
-  const prompt = buildDeepseekPrompt(body);
   const client = await getClient();
   const conversation = await getConversationState(req, client);
+  const isContinuation = conversation.parentMessageId != null;
   conversation.session.setParentMessageId(conversation.parentMessageId);
 
-  const deepseekResponse = await client.sendMessage(prompt, conversation.session, {
-    thinking_enabled: false,
-    search_enabled: false,
-  });
+  const prompt = buildDeepseekPrompt(body, isContinuation);
+  if (prompt.trim().length === 0 || prompt.trim() === "Assistant:") {
+    return anthropicError("Prompt is empty after extracting the latest turn");
+  }
+
+  let deepseekResponse: Response;
+  try {
+    deepseekResponse = await client.sendMessage(prompt, conversation.session, {
+      thinking_enabled: false,
+      search_enabled: false,
+    });
+  } catch (error) {
+    const msg = error instanceof Error ? error.message : String(error);
+    return anthropicError(`DeepSeek request failed: ${msg}`, 502);
+  }
 
   if (!deepseekResponse.ok) {
-    return anthropicError(`DeepSeek upstream failed with status ${deepseekResponse.status}`, 502);
+    const detail = await readUpstreamError(deepseekResponse);
+    const status = deepseekResponse.status === 401 || deepseekResponse.status === 403 ? 401 : 502;
+    const hint =
+      status === 401
+        ? "DeepSeek rejected the token — DEEPSEEK_TOKEN is missing, expired, or invalid."
+        : `DeepSeek upstream error ${deepseekResponse.status}: ${detail}`;
+    return anthropicError(hint, status);
   }
 
   const anthropicModel = body.model || "deepseek-chat";
   const messageId = `msg_${crypto.randomUUID().replace(/-/g, "")}`;
   const toolCallId = `toolu_${crypto.randomUUID().replace(/-/g, "")}`;
-  const deepseekOutput = await collectDeepseekOutput(deepseekResponse);
-  const text = deepseekOutput.text;
-  const parsedToolCall = parseToolCallFromText(text, body.tools);
+  const hasTools = Array.isArray(body.tools) && body.tools.length > 0;
 
-  if (deepseekOutput.responseMessageId !== null) {
-    conversation.parentMessageId = deepseekOutput.responseMessageId;
-    conversation.session.setParentMessageId(deepseekOutput.responseMessageId);
-    conversation.updatedAt = Date.now();
-  }
+  const persistIds = (idState: { requestMessageId: number | null; responseMessageId: number | null }) => {
+    try {
+      if (idState.responseMessageId !== null) {
+        conversation.parentMessageId = idState.responseMessageId;
+        conversation.session.setParentMessageId(idState.responseMessageId);
+      }
+      conversation.updatedAt = Date.now();
+    } catch (error) {
+      // Never let bookkeeping swallow a real upstream error from the caller's finally.
+      console.error("persistIds failed:", error);
+    }
+  };
 
-  if (body.stream) {
-    const stream = new ReadableStream<string>({
-      async start(controller) {
-        writeSseEvent(controller, "message_start", {
-          type: "message_start",
-          message: {
-            id: messageId,
-            type: "message",
-            role: "assistant",
-            model: anthropicModel,
-            content: [],
-            stop_reason: null,
-            stop_sequence: null,
-            usage: { input_tokens: 0, output_tokens: 0 },
-          },
-        });
+  if (!body.stream) {
+    const streamState: DeepseekStreamState = {
+      idState: { requestMessageId: null, responseMessageId: null },
+    };
+    let text = "";
+    try {
+      for await (const chunk of streamDeepseek(deepseekResponse, streamState, req.signal)) {
+        text += chunk;
+      }
+    } finally {
+      persistIds(streamState.idState);
+    }
 
-        try {
-          if (parsedToolCall) {
-            writeSseEvent(controller, "content_block_start", {
-              type: "content_block_start",
-              index: 0,
-              content_block: {
-                type: "tool_use",
-                id: toolCallId,
-                name: parsedToolCall.name,
-                input: {},
-              },
-            });
+    const parsedToolCall = hasTools ? parseToolCallFromText(text, body.tools) : null;
+    const usage = { input_tokens: 0, output_tokens: Math.max(1, Math.ceil(text.length / 4)) };
 
-            writeSseEvent(controller, "content_block_delta", {
-              type: "content_block_delta",
-              index: 0,
-              delta: {
-                type: "input_json_delta",
-                partial_json: JSON.stringify(parsedToolCall.input),
-              },
-            });
+    if (parsedToolCall) {
+      return Response.json({
+        id: messageId,
+        type: "message",
+        role: "assistant",
+        model: anthropicModel,
+        content: [
+          { type: "tool_use", id: toolCallId, name: parsedToolCall.name, input: parsedToolCall.input },
+        ],
+        stop_reason: "tool_use",
+        stop_sequence: null,
+        usage,
+      });
+    }
 
-            writeSseEvent(controller, "content_block_stop", {
-              type: "content_block_stop",
-              index: 0,
-            });
-
-            writeSseEvent(controller, "message_delta", {
-              type: "message_delta",
-              delta: { stop_reason: "tool_use", stop_sequence: null },
-              usage: { output_tokens: Math.ceil(text.length / 4) },
-            });
-          } else {
-            writeSseEvent(controller, "content_block_start", {
-              type: "content_block_start",
-              index: 0,
-              content_block: { type: "text", text: "" },
-            });
-
-            for (const textChunk of splitTextForSse(text)) {
-              writeSseEvent(controller, "content_block_delta", {
-                type: "content_block_delta",
-                index: 0,
-                delta: {
-                  type: "text_delta",
-                  text: textChunk,
-                },
-              });
-            }
-
-            writeSseEvent(controller, "content_block_stop", {
-              type: "content_block_stop",
-              index: 0,
-            });
-
-            writeSseEvent(controller, "message_delta", {
-              type: "message_delta",
-              delta: { stop_reason: "end_turn", stop_sequence: null },
-              usage: { output_tokens: Math.ceil(text.length / 4) },
-            });
-          }
-
-          writeSseEvent(controller, "message_stop", { type: "message_stop" });
-          controller.close();
-        } catch (error) {
-          writeSseEvent(controller, "error", {
-            type: "error",
-            error: {
-              type: "api_error",
-              message: error instanceof Error ? error.message : "Streaming failed",
-            },
-          });
-          controller.close();
-        }
-      },
-    });
-
-    return new Response(stream, {
-      headers: {
-        "content-type": "text/event-stream; charset=utf-8",
-        "cache-control": "no-cache, no-transform",
-        connection: "keep-alive",
-      },
-    });
-  }
-
-  if (parsedToolCall) {
     return Response.json({
       id: messageId,
       type: "message",
       role: "assistant",
       model: anthropicModel,
-      content: [
-        {
-          type: "tool_use",
-          id: toolCallId,
-          name: parsedToolCall.name,
-          input: parsedToolCall.input,
-        },
-      ],
-      stop_reason: "tool_use",
+      content: [{ type: "text", text }],
+      stop_reason: "end_turn",
       stop_sequence: null,
-      usage: {
-        input_tokens: 0,
-        output_tokens: Math.ceil(text.length / 4),
-      },
+      usage,
     });
   }
 
-  return Response.json({
-    id: messageId,
-    type: "message",
-    role: "assistant",
-    model: anthropicModel,
-    content: [{ type: "text", text }],
-    stop_reason: "end_turn",
-    stop_sequence: null,
-    usage: {
-      input_tokens: 0,
-      output_tokens: Math.ceil(text.length / 4),
+  const streamState: DeepseekStreamState = {
+    idState: { requestMessageId: null, responseMessageId: null },
+  };
+
+  const stream = new ReadableStream<string>({
+    async start(controller) {
+      const send = (event: string, payload: Record<string, unknown>) => {
+        writeSseEvent(controller, event, payload);
+      };
+      const closeController = () => {
+        try {
+          controller.close();
+        } catch {
+          /* already closed */
+        }
+      };
+
+      send("message_start", {
+        type: "message_start",
+        message: {
+          id: messageId,
+          type: "message",
+          role: "assistant",
+          model: anthropicModel,
+          content: [],
+          stop_reason: null,
+          stop_sequence: null,
+          usage: { input_tokens: 0, output_tokens: 0 },
+        },
+      });
+
+      type Mode = "undecided" | "text" | "tool";
+      let mode: Mode = hasTools ? "undecided" : "text";
+      let pending = "";
+      let textOpened = false;
+      let textChars = 0;
+
+      const openTextBlock = () => {
+        if (textOpened) return;
+        send("content_block_start", {
+          type: "content_block_start",
+          index: 0,
+          content_block: { type: "text", text: "" },
+        });
+        textOpened = true;
+      };
+
+      const emitText = (text: string) => {
+        if (!text) return;
+        openTextBlock();
+        for (const piece of splitTextForSse(text, 256)) {
+          send("content_block_delta", {
+            type: "content_block_delta",
+            index: 0,
+            delta: { type: "text_delta", text: piece },
+          });
+        }
+        textChars += text.length;
+      };
+
+      const finishAsToolUse = (name: string, input: Record<string, unknown>, tokens: number) => {
+        send("content_block_start", {
+          type: "content_block_start",
+          index: 0,
+          content_block: { type: "tool_use", id: toolCallId, name, input: {} },
+        });
+        send("content_block_delta", {
+          type: "content_block_delta",
+          index: 0,
+          delta: { type: "input_json_delta", partial_json: JSON.stringify(input) },
+        });
+        send("content_block_stop", { type: "content_block_stop", index: 0 });
+        send("message_delta", {
+          type: "message_delta",
+          delta: { stop_reason: "tool_use", stop_sequence: null },
+          usage: { output_tokens: Math.max(1, tokens) },
+        });
+        send("message_stop", { type: "message_stop" });
+        closeController();
+      };
+
+      const finishAsText = (override?: string) => {
+        if (override !== undefined) {
+          pending = "";
+          emitText(override);
+        } else if (pending.length > 0) {
+          emitText(pending);
+          pending = "";
+        }
+        if (!textOpened) openTextBlock();
+        send("content_block_stop", { type: "content_block_stop", index: 0 });
+        send("message_delta", {
+          type: "message_delta",
+          delta: { stop_reason: "end_turn", stop_sequence: null },
+          usage: { output_tokens: Math.max(1, Math.ceil(textChars / 4)) },
+        });
+        send("message_stop", { type: "message_stop" });
+        closeController();
+      };
+
+      try {
+        for await (const chunk of streamDeepseek(deepseekResponse, streamState, req.signal)) {
+          if (mode === "text") {
+            emitText(chunk);
+            continue;
+          }
+
+          pending += chunk;
+
+          if (mode === "undecided") {
+            const trimmed = pending.trimStart();
+            if (trimmed.length === 0) continue;
+            if (looksLikeJsonStart(pending)) {
+              mode = "tool";
+            } else if (trimmed.length >= PEEK_THRESHOLD) {
+              mode = "text";
+              emitText(pending);
+              pending = "";
+            }
+          }
+        }
+
+        if (mode === "tool") {
+          const parsed = parseToolCallFromText(pending, body.tools);
+          if (parsed) {
+            finishAsToolUse(parsed.name, parsed.input, Math.ceil(pending.length / 4));
+          } else {
+            // Model tried to emit a tool call but produced invalid JSON.
+            // Don't forward the broken payload to the client as text —
+            // substitute a short error string.
+            finishAsText("[tool_call_parse_failed]");
+          }
+        } else {
+          finishAsText();
+        }
+      } catch (error) {
+        send("error", {
+          type: "error",
+          error: {
+            type: "api_error",
+            message: error instanceof Error ? error.message : "Streaming failed",
+          },
+        });
+        closeController();
+      } finally {
+        persistIds(streamState.idState);
+      }
+    },
+  });
+
+  return new Response(stream, {
+    headers: {
+      "content-type": "text/event-stream; charset=utf-8",
+      "cache-control": "no-cache, no-transform",
+      connection: "keep-alive",
     },
   });
 }
