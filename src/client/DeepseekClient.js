@@ -74,22 +74,6 @@ class DeepseekClient {
         }
     }
 
-    async *streamResponse(response) {
-        const reader = response.body.getReader();
-        const decoder = new TextDecoder();
-
-        try {
-            while (true) {
-                const { done, value } = await reader.read();
-                if (done) break;
-                
-                const chunk = decoder.decode(value);
-                yield chunk;
-            }
-        } finally {
-            reader.releaseLock();
-        }
-    }
 }
 
 module.exports = DeepseekClient; 

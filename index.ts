@@ -638,15 +638,7 @@ async function readUpstreamError(response: Response): Promise<string> {
   }
 }
 
-function looksLikeJsonStart(text: string): boolean {
-  const trimmed = text.trimStart();
-  if (trimmed.length === 0) return false;
-  if (trimmed.startsWith("{")) return true;
-  if (/^```(?:json)?/i.test(trimmed)) return true;
-  return false;
-}
-
-const PEEK_THRESHOLD = 48;
+type SseSender = (event: string, payload: Record<string, unknown>) => void;
 
 async function handleMessages(req: Request): Promise<Response> {
   if (PROXY_API_KEY) {
@@ -762,12 +754,103 @@ async function handleMessages(req: Request): Promise<Response> {
   const streamState: DeepseekStreamState = {
     idState: { requestMessageId: null, responseMessageId: null },
   };
+  const sseHeaders = {
+    "content-type": "text/event-stream; charset=utf-8",
+    "cache-control": "no-cache, no-transform",
+    connection: "keep-alive",
+  };
 
+  const sendMessageStart = (send: SseSender) => {
+    send("message_start", {
+      type: "message_start",
+      message: {
+        id: messageId,
+        type: "message",
+        role: "assistant",
+        model: anthropicModel,
+        content: [],
+        stop_reason: null,
+        stop_sequence: null,
+        usage: { input_tokens: 0, output_tokens: 0 },
+      },
+    });
+  };
+
+  // With tools declared we cannot stream token-by-token: the model may wrap
+  // the JSON tool call in prose, or split the JSON across many small chunks.
+  // Buffer the whole response, then emit a single tool_use OR text block.
+  if (hasTools) {
+    let fullText = "";
+    try {
+      for await (const chunk of streamDeepseek(deepseekResponse, streamState, req.signal)) {
+        fullText += chunk;
+      }
+    } finally {
+      persistIds(streamState.idState);
+    }
+
+    const parsed = parseToolCallFromText(fullText, body.tools);
+    const tokens = Math.max(1, Math.ceil(fullText.length / 4));
+
+    const stream = new ReadableStream<string>({
+      start(controller) {
+        const send: SseSender = (event, payload) => writeSseEvent(controller, event, payload);
+        sendMessageStart(send);
+
+        if (parsed) {
+          send("content_block_start", {
+            type: "content_block_start",
+            index: 0,
+            content_block: { type: "tool_use", id: toolCallId, name: parsed.name, input: {} },
+          });
+          send("content_block_delta", {
+            type: "content_block_delta",
+            index: 0,
+            delta: { type: "input_json_delta", partial_json: JSON.stringify(parsed.input) },
+          });
+          send("content_block_stop", { type: "content_block_stop", index: 0 });
+          send("message_delta", {
+            type: "message_delta",
+            delta: { stop_reason: "tool_use", stop_sequence: null },
+            usage: { output_tokens: tokens },
+          });
+        } else {
+          send("content_block_start", {
+            type: "content_block_start",
+            index: 0,
+            content_block: { type: "text", text: "" },
+          });
+          for (const piece of splitTextForSse(fullText, 256)) {
+            send("content_block_delta", {
+              type: "content_block_delta",
+              index: 0,
+              delta: { type: "text_delta", text: piece },
+            });
+          }
+          send("content_block_stop", { type: "content_block_stop", index: 0 });
+          send("message_delta", {
+            type: "message_delta",
+            delta: { stop_reason: "end_turn", stop_sequence: null },
+            usage: { output_tokens: tokens },
+          });
+        }
+
+        send("message_stop", { type: "message_stop" });
+        try {
+          controller.close();
+        } catch {
+          /* already closed */
+        }
+      },
+    });
+
+    return new Response(stream, { headers: sseHeaders });
+  }
+
+  // No tools — true token-by-token streaming.
   const stream = new ReadableStream<string>({
     async start(controller) {
-      const send = (event: string, payload: Record<string, unknown>) => {
-        writeSseEvent(controller, event, payload);
-      };
+      const send: SseSender = (event, payload) => writeSseEvent(controller, event, payload);
       const closeController = () => {
         try {
           controller.close();
@@ -776,23 +859,8 @@ async function handleMessages(req: Request): Promise<Response> {
         }
       };
 
-      send("message_start", {
-        type: "message_start",
-        message: {
-          id: messageId,
-          type: "message",
-          role: "assistant",
-          model: anthropicModel,
-          content: [],
-          stop_reason: null,
-          stop_sequence: null,
-          usage: { input_tokens: 0, output_tokens: 0 },
-        },
-      });
+      sendMessageStart(send);
 
-      type Mode = "undecided" | "text" | "tool";
-      let mode: Mode = hasTools ? "undecided" : "text";
-      let pending = "";
       let textOpened = false;
       let textChars = 0;
 
@@ -819,36 +887,11 @@ async function handleMessages(req: Request): Promise<Response> {
         textChars += text.length;
       };
 
-      const finishAsToolUse = (name: string, input: Record<string, unknown>, tokens: number) => {
-        send("content_block_start", {
-          type: "content_block_start",
-          index: 0,
-          content_block: { type: "tool_use", id: toolCallId, name, input: {} },
-        });
-        send("content_block_delta", {
-          type: "content_block_delta",
-          index: 0,
-          delta: { type: "input_json_delta", partial_json: JSON.stringify(input) },
-        });
-        send("content_block_stop", { type: "content_block_stop", index: 0 });
-        send("message_delta", {
-          type: "message_delta",
-          delta: { stop_reason: "tool_use", stop_sequence: null },
-          usage: { output_tokens: Math.max(1, tokens) },
-        });
-        send("message_stop", { type: "message_stop" });
-        closeController();
-      };
-
-      const finishAsText = (override?: string) => {
-        if (override !== undefined) {
-          pending = "";
-          emitText(override);
-        } else if (pending.length > 0) {
-          emitText(pending);
-          pending = "";
+      try {
+        for await (const chunk of streamDeepseek(deepseekResponse, streamState, req.signal)) {
+          emitText(chunk);
         }
-        if (!textOpened) openTextBlock();
+        openTextBlock();
         send("content_block_stop", { type: "content_block_stop", index: 0 });
         send("message_delta", {
           type: "message_delta",
@@ -857,43 +900,6 @@ async function handleMessages(req: Request): Promise<Response> {
         });
         send("message_stop", { type: "message_stop" });
         closeController();
-      };
-
-      try {
-        for await (const chunk of streamDeepseek(deepseekResponse, streamState, req.signal)) {
-          if (mode === "text") {
-            emitText(chunk);
-            continue;
-          }
-
-          pending += chunk;
-
-          if (mode === "undecided") {
-            const trimmed = pending.trimStart();
-            if (trimmed.length === 0) continue;
-            if (looksLikeJsonStart(pending)) {
-              mode = "tool";
-            } else if (trimmed.length >= PEEK_THRESHOLD) {
-              mode = "text";
-              emitText(pending);
-              pending = "";
-            }
-          }
-        }
-
-        if (mode === "tool") {
-          const parsed = parseToolCallFromText(pending, body.tools);
-          if (parsed) {
-            finishAsToolUse(parsed.name, parsed.input, Math.ceil(pending.length / 4));
-          } else {
-            // Model tried to emit a tool call but produced invalid JSON.
-            // Don't forward the broken payload to the client as text —
-            // substitute a short error string.
-            finishAsText("[tool_call_parse_failed]");
-          }
-        } else {
-          finishAsText();
-        }
       } catch (error) {
         send("error", {
           type: "error",
@@ -909,13 +915,7 @@ async function handleMessages(req: Request): Promise<Response> {
     },
   });
 
-  return new Response(stream, {
-    headers: {
-      "content-type": "text/event-stream; charset=utf-8",
-      "cache-control": "no-cache, no-transform",
-      connection: "keep-alive",
-    },
-  });
+  return new Response(stream, { headers: sseHeaders });
 }
 
 const server = Bun.serve({
